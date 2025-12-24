@@ -1,0 +1,6 @@
+gex-dashboard/
+  app.py
+  gex.py
+  polygon_data.py
+  requirements.txt
+  .streamlit/config.toml
