@@ -11,6 +11,9 @@ def _get(url, params):
         raise RuntimeError(f"Polygon auth error ({r.status_code}). Check POLYGON_API_KEY and plan.")
     r.raise_for_status()
     return r.json()
+    
+if r.status_code in (401, 403):
+    raise RuntimeError(f"{r.status_code} {r.text}")
 
 def get_spot(ticker: str, api_key: str) -> float:
     # Last trade (works widely)
