@@ -27,6 +27,9 @@ with colC:
 with st.spinner("Fetching data from Polygon..."):
     spot = get_spot(underlying, api_key)
     chain_df, exp = get_chain_0dte(underlying, api_key, asof)
+except Exception as e:
+    st.error(str(e))
+    st.stop()    
 
 st.caption(f"Spot: {spot:.2f} | Expiration used: {exp.isoformat()} | Contracts: {len(chain_df)}")
 
