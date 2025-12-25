@@ -1,117 +1,139 @@
 import os
+import time
 import requests
-import datetime as dt
 import pandas as pd
 
-POLY = "https://api.polygon.io"
 
-def _get(url, params):
-    r = requests.get(url, params=params, timeout=10)
-#    if r.status_code in (401, 403):
-#        raise RuntimeError(f"Polygon auth error ({r.status_code}). Check POLYGON_API_KEY and plan.") 
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
+BASE = "https://api.polygon.io"
+
+
+class PolygonAuthError(Exception):
+    pass
+
+
+class PolygonRequestError(Exception):
+    pass
+
+
+def _get_json(url: str, params: dict | None = None, timeout: int = 30) -> dict:
+    if not POLYGON_API_KEY:
+        raise PolygonAuthError("POLYGON_API_KEY is empty. Add it to Railway Variables.")
+
+    params = dict(params or {})
+    params["apiKey"] = POLYGON_API_KEY
+
+    r = requests.get(url, params=params, timeout=timeout)
+
+    # Явно обрабатываем ошибки доступа/плана
     if r.status_code in (401, 403):
-        raise RuntimeError(f"{r.status_code} {r.text}")
-        r.raise_for_status()
+        try:
+            payload = r.json()
+        except Exception:
+            payload = {"message": r.text}
+        raise PolygonAuthError(f"Polygon auth error ({r.status_code}): {payload}")
+
+    if r.status_code >= 400:
+        raise PolygonRequestError(f"Polygon request failed ({r.status_code}): {r.text}")
+
     return r.json()
 
-def get_spot(ticker: str, api_key: str) -> float:
-    # Last trade (works widely)
-    data = _get(f"{POLY}/v2/last/trade/{ticker}", {"apiKey": api_key})
-    return float(data["last"]["price"])
 
-def get_nearest_expiration_0dte(underlying: str, api_key: str, asof: dt.date) -> dt.date:
+def fetch_0dte_abs_gex_by_strike(
+    underlying: str,
+    as_of: str,
+    contract_type: str | None = None,  # "call" | "put" | None
+    limit: int = 250,
+    sleep_s: float = 0.0,
+) -> pd.DataFrame:
     """
-    Finds nearest expiration >= asof. For 0DTE, we prefer same day if exists.
+    Pull 0DTE option chain snapshot for `underlying` and expiration_date=`as_of`,
+    compute per-strike:
+      CallGEX = sum(gamma * open_interest) for calls
+      PutGEX  = sum(gamma * open_interest) for puts  (kept negative sign for convenience)
+      AbsGEX  = abs(CallGEX) + abs(PutGEX_signed)
+
+    No spot used. No multiplier applied (если захочешь *100 — скажешь).
     """
-    # Options contracts list (paginate if needed later; MVP keeps it simple)
-    url = f"{POLY}/v3/reference/options/contracts"
+    underlying = underlying.upper().strip()
+
+    url = f"{BASE}/v3/snapshot/options/{underlying}"
     params = {
-        "apiKey": api_key,
-        "underlying_ticker": underlying,
-        "limit": 1000,
-        "sort": "expiration_date",
-        "order": "asc",
-        "as_of": asof.isoformat(),
+        "expiration_date": as_of,   # 0DTE
+        "limit": int(limit),
     }
-    data = _get(url, params)
-    exps = []
-    for c in data.get("results", []):
-        ed = c.get("expiration_date")
-        if ed:
-            exps.append(dt.date.fromisoformat(ed))
-    if not exps:
-        raise RuntimeError("Polygon did not return any expirations for this underlying.")
-    exps = sorted(set(exps))
-    # Prefer same-day (0DTE) if present
-    if asof in exps:
-        return asof
-    # else nearest future
-    for e in exps:
-        if e >= asof:
-            return e
-    return exps[-1]
+    if contract_type in ("call", "put"):
+        params["contract_type"] = contract_type
 
-def get_chain_0dte(underlying: str, api_key: str, asof: dt.date) -> pd.DataFrame:
-    """
-    Returns a DataFrame of option contracts for nearest expiration (0DTE if available).
-    Columns: strike, type(call/put), open_interest, iv(optional), gamma(optional), tte_years
-    """
-    exp = get_nearest_expiration_0dte(underlying, api_key, asof)
+    rows: list[dict] = []
+    next_url: str | None = None
 
-    url = f"{POLY}/v3/reference/options/contracts"
-    params = {
-        "apiKey": api_key,
-        "underlying_ticker": underlying,
-        "expiration_date": exp.isoformat(),
-        "limit": 1000,
-        "sort": "strike_price",
-        "order": "asc",
-        "as_of": asof.isoformat(),
-    }
-    data = _get(url, params)
-    rows = []
-    for c in data.get("results", []):
-        strike = c.get("strike_price")
-        opt_type = c.get("contract_type")  # "call"/"put"
-        ticker = c.get("ticker")
-        if strike is None or opt_type not in ("call", "put") or not ticker:
-            continue
-        rows.append({"option_ticker": ticker, "strike": float(strike), "type": opt_type})
+    while True:
+        if next_url:
+            data = _get_json(next_url, params={})  # next_url уже содержит apiKey? нет -> мы добавим в _get_json
+        else:
+            data = _get_json(url, params=params)
+
+        results = data.get("results") or []
+        for item in results:
+            details = item.get("details") or {}
+            greeks = item.get("greeks") or {}
+
+            strike = details.get("strike_price")
+            ctype = details.get("contract_type")  # "call" / "put"
+            gamma = greeks.get("gamma")
+            oi = item.get("open_interest")
+
+            if strike is None or ctype not in ("call", "put"):
+                continue
+            if gamma is None or oi is None:
+                # у некоторых контрактов greeks могут быть пустыми — пропускаем
+                continue
+
+            rows.append(
+                {
+                    "strike": float(strike),
+                    "type": ctype,
+                    "gamma": float(gamma),
+                    "open_interest": float(oi),
+                }
+            )
+
+        next_url = data.get("next_url")
+        if not next_url:
+            break
+
+        # Massive/Polygon next_url обычно без apiKey — добавим его
+        if "apiKey=" not in next_url and POLYGON_API_KEY:
+            sep = "&" if "?" in next_url else "?"
+            next_url = f"{next_url}{sep}apiKey={POLYGON_API_KEY}"
+
+        if sleep_s and sleep_s > 0:
+            time.sleep(sleep_s)
+
+    if not rows:
+        return pd.DataFrame(columns=["strike", "call_gex", "put_gex", "abs_gex"])
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        raise RuntimeError("No option contracts returned for that expiration.")
+    df["gex"] = df["gamma"] * df["open_interest"]
 
-    # Pull snapshots (open interest, iv, greeks) per option ticker.
-    # Endpoint availability may vary by plan; we’ll attempt and fill missing gracefully.
-    snap_rows = []
-    for t in df["option_ticker"].tolist():
-        try:
-            snap = _get(f"{POLY}/v3/snapshot/options/{underlying}/{t}", {"apiKey": api_key})
-            # Schema can vary; extract defensively:
-            res = snap.get("results", {}) or {}
-            details = res.get("details", {}) or {}
-            greeks = res.get("greeks", {}) or {}
-            iv = res.get("implied_volatility")
-            oi = res.get("open_interest")
-            gamma = greeks.get("gamma")
+    # calls positive, puts negative (удобно для Net, но Abs считаем отдельно)
+    df.loc[df["type"] == "put", "gex"] *= -1.0
 
-            snap_rows.append({
-                "option_ticker": t,
-                "open_interest": oi,
-                "iv": iv,
-                "gamma": gamma,
-            })
-        except Exception:
-            snap_rows.append({"option_ticker": t, "open_interest": None, "iv": None, "gamma": None})
+    # агрегируем по strike
+    pivot = df.pivot_table(index="strike", columns="type", values="gex", aggfunc="sum").fillna(0.0)
+    # гарантируем колонки
+    if "call" not in pivot.columns:
+        pivot["call"] = 0.0
+    if "put" not in pivot.columns:
+        pivot["put"] = 0.0
 
-    snap_df = pd.DataFrame(snap_rows)
-    out = df.merge(snap_df, on="option_ticker", how="left")
+    out = (
+        pivot.rename(columns={"call": "call_gex", "put": "put_gex"})
+        .reset_index()
+        .sort_values("strike")
+        .reset_index(drop=True)
+    )
 
-    # time to expiration in years (approx). For 0DTE, set tiny positive to avoid divide-by-zero
-    tte_days = max((exp - asof).days, 0)
-    out["tte_years"] = max(tte_days, 0) / 365.0
-    if out["tte_years"].iloc[0] == 0.0:
-        out["tte_years"] = 1.0 / 365.0  # treat 0DTE as 1 day for stability
-
-    return out, exp
+    out["abs_gex"] = out["call_gex"].abs() + out["put_gex"].abs()
+    return out
