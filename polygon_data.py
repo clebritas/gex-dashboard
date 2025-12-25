@@ -7,8 +7,8 @@ POLY = "https://api.polygon.io"
 
 def _get(url, params):
     r = requests.get(url, params=params, timeout=10)
-    if r.status_code in (401, 403):
-        raise RuntimeError(f"Polygon auth error ({r.status_code}). Check POLYGON_API_KEY and plan.") 
+#    if r.status_code in (401, 403):
+#        raise RuntimeError(f"Polygon auth error ({r.status_code}). Check POLYGON_API_KEY and plan.") 
     if r.status_code in (401, 403):
         raise RuntimeError(f"{r.status_code} {r.text}")
         r.raise_for_status()
