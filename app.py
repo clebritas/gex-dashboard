@@ -1,187 +1,206 @@
 # app.py
 import os
 import time
+import datetime as dt
+from zoneinfo import ZoneInfo
+from typing import Dict, Any, List, Tuple
+
 import requests
 import pandas as pd
 import streamlit as st
 
-from datetime import date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 # -----------------------
-# Page
+# Config
 # -----------------------
-st.set_page_config(page_title="0DTE Absolute GEX by Strike", layout="wide")
-st.title("0DTE Absolute GEX by Strike (Abs(CallGEX) + Abs(PutGEX))")
-
-NY = ZoneInfo("America/New_York")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-
-DEFAULT_TTL = 60
-DEFAULT_UNDERLYING = "SPY"
-
-
-# -----------------------
-# Time helpers (ET)
-# -----------------------
-def et_now() -> datetime:
-    return datetime.now(NY)
-
-def et_today() -> date:
-    return et_now().date()
-
-def is_weekend(d: date) -> bool:
-    return d.weekday() >= 5
-
-def prev_weekday(d: date) -> date:
-    d -= timedelta(days=1)
-    while is_weekend(d):
-        d -= timedelta(days=1)
-    return d
-
-def last_weekday(d: date) -> date:
-    while is_weekend(d):
-        d -= timedelta(days=1)
-    return d
+BASE = "https://api.polygon.io"
+ET = ZoneInfo("America/New_York")
 
 
 # -----------------------
-# Polygon helpers
+# Helpers
 # -----------------------
-def _polygon_get(url: str, params: dict) -> dict:
-    r = requests.get(url, params=params, timeout=30)
+def et_now() -> dt.datetime:
+    return dt.datetime.now(tz=ET)
+
+
+def _polygon_get(url: str, params: Dict[str, Any] | None = None, timeout: int = 30) -> Dict[str, Any]:
+    if not POLYGON_API_KEY:
+        raise RuntimeError("POLYGON_API_KEY is empty. Add it in Railway Variables.")
+    params = dict(params or {})
+    params["apiKey"] = POLYGON_API_KEY
+
+    r = requests.get(url, params=params, timeout=timeout)
     if r.status_code in (401, 403):
-        raise PermissionError(f"{r.status_code} {r.text}")
+        # Show Polygon error body (often contains 'NOT_AUTHORIZED' message)
+        raise PermissionError(f"Polygon auth error ({r.status_code}): {r.text}")
     r.raise_for_status()
     return r.json()
 
-def polygon_market_is_open_best_effort() -> bool | None:
-    """Returns True/False if accessible, else None."""
-    if not POLYGON_API_KEY:
-        return None
-    try:
-        data = _polygon_get("https://api.polygon.io/v1/marketstatus/now", {"apiKey": POLYGON_API_KEY})
-        m = (data.get("market") or "").lower()
-        if m in ("open", "closed"):
-            return m == "open"
-        return None
-    except Exception:
-        return None
 
-def get_effective_et_trade_date() -> date:
+def fetch_snapshot_chain(
+    underlying: str,
+    expiration_date: str,
+    ttl_sec: int,
+    force_refresh: bool,
+) -> List[Dict[str, Any]]:
     """
-    'Broker-like' behavior:
-    - If market open -> today (ET, weekday)
-    - If market closed -> previous weekday
-    Notes:
-    - We don't try to model holidays here; if a day is a holiday, snapshot will simply have no 0DTE,
-      and you'd still see "No rows". For true holiday handling, we’d need a trading calendar or store history.
+    Uses Polygon Snapshot Options Chain endpoint.
+    NOTE: Snapshot is "current" and typically includes only active contracts.
     """
-    today = last_weekday(et_today())
-    market_open = polygon_market_is_open_best_effort()
-    if market_open is False:
-        return prev_weekday(today)
-    return today
+    cache_key = f"snapshot_chain::{underlying}::{expiration_date}"
 
+    # Manual cache in session_state (survives reruns; not app restarts)
+    now_ts = time.time()
+    cache = st.session_state.get("cache", {})
+    entry = cache.get(cache_key)
 
-# -----------------------
-# Data: snapshot 0DTE
-# -----------------------
-def fetch_chain_0dte_snapshot(underlying: str, exp_date: date, max_pages: int = 10) -> pd.DataFrame:
-    """
-    Snapshot is LIVE data. It only knows about contracts that exist now.
-    So exp_date must be "today's 0DTE" (or the last trading day we can still access in snapshot).
-    """
-    if not POLYGON_API_KEY:
-        raise ValueError("POLYGON_API_KEY is empty. Add it in Railway Variables.")
+    if (not force_refresh) and entry:
+        age = now_ts - entry["ts"]
+        if age <= ttl_sec:
+            return entry["data"]
 
-    base_url = f"https://api.polygon.io/v3/snapshot/options/{underlying.upper()}"
-    params = {"apiKey": POLYGON_API_KEY, "limit": 250}
+    # Pull snapshot chain (paginate if needed)
+    url = f"{BASE}/v3/snapshot/options/{underlying}"
+    params = {
+        "expiration_date": expiration_date,
+        "limit": 250,
+    }
 
-    rows = []
-    url = base_url
-    pages = 0
+    data: List[Dict[str, Any]] = []
+    j = _polygon_get(url, params=params)
 
-    while url and pages < max_pages:
-        pages += 1
-        data = _polygon_get(url, params=params)
+    data.extend(j.get("results", []) or [])
 
-        results = data.get("results", []) or []
-        for item in results:
-            details = item.get("details", {}) or {}
-            greeks = item.get("greeks", {}) or {}
-
-            exp = details.get("expiration_date")
-            if exp != exp_date.isoformat():
-                continue
-
-            strike = details.get("strike_price")
-            opt_type = details.get("contract_type")  # "call"/"put"
-            gamma = greeks.get("gamma")
-            oi = item.get("open_interest")
-
-            if strike is None or opt_type not in ("call", "put"):
-                continue
-            if gamma is None or oi is None:
-                continue
-
-            rows.append(
-                {"strike": float(strike), "type": opt_type, "gamma": float(gamma), "open_interest": float(oi)}
-            )
-
-        next_url = data.get("next_url")
-        if next_url:
-            url = next_url
-            params = {"apiKey": POLYGON_API_KEY}
+    # Pagination: Polygon sometimes returns next_url
+    next_url = j.get("next_url")
+    while next_url:
+        # next_url might be relative or full; normalize
+        if next_url.startswith("/"):
+            next_url_full = BASE + next_url
         else:
-            url = None
+            next_url_full = next_url
 
-    return pd.DataFrame(rows)
+        # Ensure apiKey is present; easiest: call with _polygon_get which injects apiKey
+        j = _polygon_get(next_url_full, params={})
+        data.extend(j.get("results", []) or [])
+        next_url = j.get("next_url")
 
-def compute_abs_gex_by_strike(df: pd.DataFrame) -> pd.DataFrame:
+    cache[cache_key] = {"ts": now_ts, "data": data}
+    st.session_state["cache"] = cache
+    return data
+
+
+def compute_abs_gex_by_strike(snapshot_rows: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """
-    CallGEX = sum(gamma*OI) on calls
-    PutGEX  = sum(gamma*OI) on puts
-    AbsGEX  = abs(CallGEX) + abs(PutGEX)
+    Variant 2:
+    - CallGEX = gamma * open_interest
+    - PutGEX  = -gamma * open_interest   (negative sign for puts)
+    - AbsGEX per strike = abs(sum(CallGEX)) + abs(sum(PutGEX))
     """
+    records = []
+    missing_gamma = 0
+    missing_oi = 0
+
+    for row in snapshot_rows:
+        details = row.get("details") or {}
+        greeks = row.get("greeks") or {}
+
+        strike = details.get("strike_price")
+        ctype = details.get("contract_type")  # "call" / "put"
+        gamma = greeks.get("gamma")
+        oi = row.get("open_interest")
+
+        if gamma is None:
+            missing_gamma += 1
+            continue
+        if oi is None:
+            missing_oi += 1
+            continue
+        if strike is None or ctype not in ("call", "put"):
+            continue
+
+        gex = float(gamma) * float(oi)
+        if ctype == "put":
+            gex = -gex
+
+        records.append(
+            {
+                "strike": float(strike),
+                "type": ctype,
+                "gamma": float(gamma),
+                "open_interest": float(oi),
+                "gex": float(gex),
+            }
+        )
+
+    df = pd.DataFrame(records)
+    stats = {
+        "rows_total": len(snapshot_rows),
+        "rows_used": len(df),
+        "missing_gamma": missing_gamma,
+        "missing_oi": missing_oi,
+    }
+
     if df.empty:
-        return pd.DataFrame(columns=["strike", "CallGEX", "PutGEX", "AbsGEX"])
+        return df, stats
 
-    df = df.copy()
-    df["gex"] = df["gamma"] * df["open_interest"]
+    # Aggregate by strike: split calls/puts then absolute formula
+    agg = df.groupby(["strike", "type"], as_index=False)["gex"].sum()
 
-    calls = df[df["type"] == "call"].groupby("strike")["gex"].sum().rename("CallGEX")
-    puts = df[df["type"] == "put"].groupby("strike")["gex"].sum().rename("PutGEX")
+    calls = agg[agg["type"] == "call"][["strike", "gex"]].rename(columns={"gex": "call_gex"})
+    puts = agg[agg["type"] == "put"][["strike", "gex"]].rename(columns={"gex": "put_gex"})  # already negative
 
-    out = pd.concat([calls, puts], axis=1).fillna(0.0).reset_index()
-    out["AbsGEX"] = out["CallGEX"].abs() + out["PutGEX"].abs()
-    out = out.sort_values("strike").reset_index(drop=True)
-    return out
+    out = pd.merge(calls, puts, on="strike", how="outer").fillna(0.0)
+    out["abs_gex"] = out["call_gex"].abs() + out["put_gex"].abs()
+    out = out.sort_values("abs_gex", ascending=False).reset_index(drop=True)
+    return out, stats
+
+
+def demo_data() -> pd.DataFrame:
+    # Simple synthetic example to verify computation & chart
+    # (call_gex positive, put_gex negative, abs = abs(call) + abs(put))
+    data = [
+        {"strike": 470, "call_gex": 1200.0, "put_gex": -800.0},
+        {"strike": 475, "call_gex": 300.0, "put_gex": -2200.0},
+        {"strike": 480, "call_gex": 900.0, "put_gex": -900.0},
+        {"strike": 485, "call_gex": 1500.0, "put_gex": -200.0},
+    ]
+    df = pd.DataFrame(data)
+    df["abs_gex"] = df["call_gex"].abs() + df["put_gex"].abs()
+    return df.sort_values("abs_gex", ascending=False).reset_index(drop=True)
 
 
 # -----------------------
-# Cache
+# UI
 # -----------------------
-@st.cache_data(show_spinner=False)
-def cached_abs_gex(underlying: str, exp_date_iso: str, refresh_nonce: int, ttl_bucket: int):
-    exp_date = date.fromisoformat(exp_date_iso)
-    df_chain = fetch_chain_0dte_snapshot(underlying, exp_date)
-    df_abs = compute_abs_gex_by_strike(df_chain)
-    return df_abs
+st.set_page_config(page_title="0DTE Absolute GEX by Strike", layout="wide")
 
+st.title("0DTE Absolute GEX by Strike (Abs(CallGEX) + Abs(PutGEX))")
 
-# -----------------------
-# UI sidebar
-# -----------------------
-if "refresh_nonce" not in st.session_state:
-    st.session_state.refresh_nonce = 0
+# Session defaults
+if "asof" not in st.session_state:
+    st.session_state["asof"] = et_now().date()
+
+if "force_refresh" not in st.session_state:
+    st.session_state["force_refresh"] = False
+
+if "cache" not in st.session_state:
+    st.session_state["cache"] = {}
 
 with st.sidebar:
     st.header("Inputs")
-    underlying = st.text_input("Underlying", value=DEFAULT_UNDERLYING).upper().strip()
 
-    top_n = st.slider("Top N strikes (by AbsGEX)", min_value=5, max_value=50, value=15, step=1)
-    ttl = st.number_input("Cache TTL (sec)", min_value=0, max_value=3600, value=DEFAULT_TTL, step=10)
+    underlying = st.text_input("Underlying", value="SPY").strip().upper()
+
+    asof = st.date_input("As of (ET)", value=st.session_state["asof"])
+    st.session_state["asof"] = asof
+
+    top_n = st.slider("Top N strikes (by AbsGEX)", 5, 50, 15)
+    ttl_sec = st.number_input("Cache TTL (sec)", min_value=0, max_value=3600, value=60, step=10)
+
+    demo_mode = st.toggle("Demo mode (no API)", value=False)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -189,67 +208,78 @@ with st.sidebar:
     with col2:
         clear_cache = st.button("🧹 Clear cache", use_container_width=True)
 
-    st.caption("Snapshot is LIVE. Historical day selection requires storing snapshots or a historical plan.")
+    if clear_cache:
+        st.session_state["cache"] = {}
+        st.toast("Cache cleared")
+
+    # Force refresh triggers a new fetch on this run
+    st.session_state["force_refresh"] = bool(refresh)
 
 
-# TTL bucketing
-if ttl <= 0:
-    ttl_bucket = int(time.time())
+# Status line
+now = et_now()
+st.caption(f"ET time now: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+
+# IMPORTANT NOTE about Snapshot vs Historical
+st.info(
+    "Важно: Polygon Snapshot обычно отдаёт **только текущие активные опционы**. "
+    "Если ты выбираешь дату, которая уже **прошла/экспирнулась**, по ней часто будет пусто. "
+    "Для стабильного просмотра прошлых дней нужно **сохранять snapshot в базе (Postgres)** или иметь отдельный исторический источник."
+)
+
+# Determine 0DTE expiration date:
+# Here we treat 'asof' as the intended 0DTE expiration date.
+expiration_date = asof.strftime("%Y-%m-%d")
+
+# Fetch / compute
+if demo_mode:
+    out = demo_data()
+    stats = {"rows_total": 0, "rows_used": len(out), "missing_gamma": 0, "missing_oi": 0}
 else:
-    ttl_bucket = int(time.time() // ttl)
+    try:
+        rows = fetch_snapshot_chain(
+            underlying=underlying,
+            expiration_date=expiration_date,
+            ttl_sec=int(ttl_sec),
+            force_refresh=bool(st.session_state["force_refresh"]),
+        )
+        out, stats = compute_abs_gex_by_strike(rows)
+    except Exception as e:
+        st.error(f"Data fetch failed: {e}")
+        st.stop()
 
-if clear_cache:
-    st.cache_data.clear()
-    st.success("Cache cleared.")
-
-if refresh:
-    st.session_state.refresh_nonce += 1
-
-# Effective date (broker-like) + status
-market_open = polygon_market_is_open_best_effort()
-effective_date = get_effective_et_trade_date()
-
-status_text = "Unknown" if market_open is None else ("Open" if market_open else "Closed")
-st.caption(f"ET time now: {et_now().strftime('%Y-%m-%d %H:%M:%S')} • Market: **{status_text}** • Using 0DTE expiration date: **{effective_date.isoformat()}**")
-
-err_box = st.empty()
-
-try:
-    if not underlying:
-        raise ValueError("Underlying is empty.")
-
-    df_abs = cached_abs_gex(
-        underlying=underlying,
-        exp_date_iso=effective_date.isoformat(),
-        refresh_nonce=st.session_state.refresh_nonce,
-        ttl_bucket=ttl_bucket,
+# Render
+if out is None or out.empty:
+    st.warning(
+        "No rows returned.\n\n"
+        "Самые частые причины:\n"
+        "• выбранная дата уже в прошлом (контракты не активны → snapshot пустой)\n"
+        "• snapshot по этим контрактам сейчас не включает greeks/open_interest\n"
+        "• лимиты/частичная выдача\n\n"
+        "Для проверки логики включи **Demo mode** в сайдбаре."
     )
 
-    if df_abs.empty:
-        st.warning(
-            "No rows returned. Most common reasons:\n"
-            "- Polygon snapshot did not include greeks/open_interest for these contracts right now\n"
-            "- Expiration date has no 0DTE contracts in snapshot (holiday / special schedule)\n"
-            "- Endpoint limits / partial data\n\n"
-            "If you want to browse past days reliably, we should store snapshots in Railway Postgres."
+    with st.expander("Debug details"):
+        st.write(stats)
+else:
+    show = out.head(int(top_n)).copy()
+    show = show.sort_values("strike")  # nicer left-to-right chart
+
+    left, right = st.columns([2, 1], gap="large")
+
+    with left:
+        st.subheader("Absolute GEX by Strike (0DTE)")
+        chart_df = show.set_index("strike")[["abs_gex"]]
+        st.bar_chart(chart_df)
+
+    with right:
+        st.subheader("Top strikes")
+        # Display table sorted by abs_gex desc
+        st.dataframe(out.head(int(top_n)), use_container_width=True, hide_index=True)
+
+    with st.expander("Debug details"):
+        st.write(stats)
+        st.caption(
+            "rows_used = количество контрактов, где нашлись И gamma, и open_interest. "
+            "Если rows_used=0 — значит Polygon не отдал нужные поля в snapshot (или контракты не активны)."
         )
-    else:
-        top = df_abs.sort_values("AbsGEX", ascending=False).head(int(top_n)).copy()
-        top = top.sort_values("strike")
-
-        st.subheader(f"{underlying} • 0DTE {effective_date.isoformat()} (ET)")
-        st.caption("AbsoluteGEX per strike = abs(sum(gamma*OI calls)) + abs(sum(gamma*OI puts))")
-
-        st.bar_chart(top.set_index("strike")[["AbsGEX"]])
-
-        with st.expander("Show table"):
-            st.dataframe(
-                top[["strike", "CallGEX", "PutGEX", "AbsGEX"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-except PermissionError as e:
-    err_box.error(f"Polygon auth/plan error: {e}")
-except Exception as e:
-    err_box.error(f"Data fetch failed: {e}")
